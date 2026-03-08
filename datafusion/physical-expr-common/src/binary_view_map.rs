@@ -292,6 +292,19 @@ where
 
             // Extract length from the view (first 4 bytes of u128 in little-endian)
             let len = view_u128 as u32;
+            let is_inline = len <= 12;
+
+            // Fetch the input value bytes once to avoid redundant memory
+            // access during hash resolution and insertion.
+            // For inline strings (<=12 bytes), extract bytes directly
+            // from the view (no memory fetch needed).
+            // For non-inline strings (>12 bytes), fetch once from the array.
+            let view_bytes = view_u128.to_le_bytes();
+            let input_value: &[u8] = if is_inline {
+                &view_bytes[4..4 + len as usize]
+            } else {
+                values.value(i).as_ref()
+            };
 
             // Check if value already exists
             let maybe_payload = {
@@ -306,7 +319,7 @@ where
                         }
 
                         // Fast path: inline strings can be compared directly
-                        if len <= 12 {
+                        if is_inline {
                             return header.view == view_u128;
                         }
 
@@ -329,7 +342,6 @@ where
                         } else {
                             &in_progress[offset..offset + stored_len]
                         };
-                        let input_value: &[u8] = values.value(i).as_ref();
                         stored_value == input_value
                     })
                     .map(|entry| entry.payload)
@@ -339,17 +351,19 @@ where
                 payload
             } else {
                 // no existing value, make a new one
-                let value: &[u8] = values.value(i).as_ref();
-                let payload = make_payload_fn(Some(value));
-
-                // Create view pointing to our buffers
-                let new_view = self.append_value(value);
+                let payload = make_payload_fn(Some(input_value));
+                let new_view = if is_inline {
+                    self.views.push(view_u128);
+                    self.nulls.append_non_null();
+                    view_u128
+                } else {
+                    self.append_value(input_value)
+                };
                 let new_header = Entry {
                     view: new_view,
                     hash,
                     payload,
                 };
-
                 self.map
                     .insert_accounted(new_header, |h| h.hash, &mut self.map_size);
                 payload
