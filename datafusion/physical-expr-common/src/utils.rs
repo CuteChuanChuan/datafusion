@@ -28,7 +28,7 @@ use arrow::array::{
     DictionaryArray, FixedSizeBinaryArray, GenericByteArray, GenericByteViewArray,
     MutableArrayData, PrimitiveArray, make_array, new_null_array,
 };
-use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
+use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow::compute::{SlicesIterator, prep_null_mask_filter};
 use arrow::datatypes::{
     ArrowDictionaryKeyType, ArrowNativeType, ArrowPrimitiveType, ByteArrayType,
@@ -76,6 +76,9 @@ const SCATTER_SLICES_SELECTIVITY_THRESHOLD: f64 = 0.8;
 pub fn scatter(mask: &BooleanArray, truthy: &dyn Array) -> Result<ArrayRef> {
     let mask = match mask.null_count() {
         0 => Cow::Borrowed(mask),
+        n if n == mask.len() => {
+            return Ok(new_null_array(truthy.data_type(), mask.len()));
+        }
         _ => Cow::Owned(prep_null_mask_filter(mask)),
     };
 
@@ -234,18 +237,11 @@ fn scatter_primitive<T: ArrowPrimitiveType>(
     selectivity: f64,
 ) -> PrimitiveArray<T> {
     let values = scatter_native(truthy.values(), mask, output_len, selectivity);
-    let mut builder = ArrayDataBuilder::new(truthy.data_type().clone())
-        .len(output_len)
-        .add_buffer(values);
+    let values = ScalarBuffer::new(values, 0, output_len);
+    let nulls = scatter_null_mask(truthy.nulls(), mask, output_len, selectivity)
+        .map(|(_, buf)| NullBuffer::new(BooleanBuffer::new(buf, 0, output_len)));
 
-    if let Some((null_count, nulls)) =
-        scatter_null_mask(truthy.nulls(), mask, output_len, selectivity)
-    {
-        builder = builder.null_count(null_count).null_bit_buffer(Some(nulls));
-    }
-
-    let data = unsafe { builder.build_unchecked() };
-    PrimitiveArray::from(data)
+    PrimitiveArray::new(values, nulls).with_data_type(truthy.data_type().clone())
 }
 
 fn scatter_boolean(
@@ -255,18 +251,11 @@ fn scatter_boolean(
     selectivity: f64,
 ) -> BooleanArray {
     let values = scatter_bits(truthy.values(), mask, output_len, selectivity);
-    let mut builder = ArrayDataBuilder::new(DataType::Boolean)
-        .len(output_len)
-        .add_buffer(values);
+    let values = BooleanBuffer::new(values, 0, output_len);
+    let nulls = scatter_null_mask(truthy.nulls(), mask, output_len, selectivity)
+        .map(|(_, buf)| NullBuffer::new(BooleanBuffer::new(buf, 0, output_len)));
 
-    if let Some((null_count, nulls)) =
-        scatter_null_mask(truthy.nulls(), mask, output_len, selectivity)
-    {
-        builder = builder.null_count(null_count).null_bit_buffer(Some(nulls));
-    }
-
-    let data = unsafe { builder.build_unchecked() };
-    BooleanArray::from(data)
+    BooleanArray::new(values, nulls)
 }
 
 fn scatter_bytes<T: ByteArrayType>(
@@ -310,6 +299,7 @@ fn scatter_bytes<T: ByteArrayType>(
         builder = builder.null_count(null_count).null_bit_buffer(Some(nulls));
     }
 
+    // SAFETY: offsets and data buffers are constructed consistently for `output_len`
     let data = unsafe { builder.build_unchecked() };
     GenericByteArray::from(data)
 }
@@ -333,6 +323,7 @@ fn scatter_byte_view<T: ByteViewType>(
         builder = builder.null_count(null_count).null_bit_buffer(Some(nulls));
     }
 
+    // SAFETY: views and data buffers are copied from a valid source array
     GenericByteViewArray::from(unsafe { builder.build_unchecked() })
 }
 
@@ -363,19 +354,10 @@ fn scatter_fixed_size_binary(
             src_idx += 1;
         }
     }
+    let nulls = scatter_null_mask(truthy.nulls(), mask, output_len, selectivity)
+        .map(|(_, buf)| NullBuffer::new(BooleanBuffer::new(buf, 0, output_len)));
 
-    let mut builder = ArrayDataBuilder::new(truthy.data_type().clone())
-        .len(output_len)
-        .add_buffer(Buffer::from(output));
-
-    if let Some((null_count, nulls)) =
-        scatter_null_mask(truthy.nulls(), mask, output_len, selectivity)
-    {
-        builder = builder.null_count(null_count).null_bit_buffer(Some(nulls));
-    }
-
-    let data = unsafe { builder.build_unchecked() };
-    FixedSizeBinaryArray::from(data)
+    FixedSizeBinaryArray::new(truthy.value_length(), Buffer::from(output), nulls)
 }
 
 fn scatter_dict<K: ArrowDictionaryKeyType>(
@@ -385,12 +367,7 @@ fn scatter_dict<K: ArrowDictionaryKeyType>(
     selectivity: f64,
 ) -> DictionaryArray<K> {
     let scattered_keys = scatter_primitive(truthy.keys(), mask, output_len, selectivity);
-    let builder = scattered_keys
-        .into_data()
-        .into_builder()
-        .data_type(truthy.data_type().clone())
-        .child_data(vec![truthy.values().to_data()]);
-    DictionaryArray::from(unsafe { builder.build_unchecked() })
+    DictionaryArray::new(scattered_keys, Arc::clone(truthy.values()))
 }
 
 fn scatter_fallback(
@@ -401,20 +378,28 @@ fn scatter_fallback(
     let truthy_data = truthy.to_data();
     let mut mutable = MutableArrayData::new(vec![&truthy_data], true, output_len);
 
+    // the SlicesIterator slices only the true values. So the gaps left by
+    // this iterator we need to fill with falsy values
+
+    // keep track of how much is filled
     let mut filled = 0;
+    // keep track of current position we have in truthy array
     let mut true_pos = 0;
 
     let mask_array = BooleanArray::new(mask.clone(), None);
     SlicesIterator::new(&mask_array).for_each(|(start, end)| {
+        // the gap needs to be filled with nulls
         if start > filled {
             mutable.extend_nulls(start - filled);
         }
+        // fill with truthy values
         let len = end - start;
         mutable.extend(0, true_pos, true_pos + len);
         true_pos += len;
         filled = end;
     });
 
+    // the remaining part is falsy
     if filled < output_len {
         mutable.extend_nulls(output_len - filled);
     }
@@ -472,6 +457,7 @@ mod tests {
         let truthy = Arc::new(Int32Array::from(vec![1, 10, 11, 100]));
         let mask = BooleanArray::from(vec![true, true, false, false, true]);
 
+        // the output array is expected to be the same length as the mask array
         let expected =
             Int32Array::from_iter(vec![Some(1), Some(10), None, None, Some(11)]);
         let result = scatter(&mask, truthy.as_ref())?;
@@ -486,6 +472,7 @@ mod tests {
         let truthy = Arc::new(Int32Array::from(vec![1, 10, 11, 100]));
         let mask = BooleanArray::from(vec![true, false, true, false, false, false]);
 
+        // output should be same length as mask
         let expected =
             Int32Array::from_iter(vec![Some(1), None, Some(10), None, None, None]);
         let result = scatter(&mask, truthy.as_ref())?;
@@ -502,6 +489,7 @@ mod tests {
             .into_iter()
             .collect();
 
+        // output should treat nulls as though they are false
         let expected = Int32Array::from_iter(vec![None, None, Some(1), Some(10), None]);
         let result = scatter(&mask, truthy.as_ref())?;
         let result = as_int32_array(&result)?;
@@ -515,6 +503,7 @@ mod tests {
         let truthy = Arc::new(BooleanArray::from(vec![false, false, false, true]));
         let mask = BooleanArray::from(vec![true, true, false, false, true]);
 
+        // the output array is expected to be the same length as the mask array
         let expected = BooleanArray::from_iter(vec![
             Some(false),
             Some(false),
@@ -638,6 +627,33 @@ mod tests {
         assert!(result.is_valid(2));
         assert!(result.is_valid(3));
         assert!(result.is_null(4));
+        Ok(())
+    }
+
+    #[test]
+    fn scatter_fixed_size_binary_test() -> Result<()> {
+        let truthy = Arc::new(FixedSizeBinaryArray::from(vec![
+            &[1u8, 2][..],
+            &[3, 4][..],
+            &[5, 6][..],
+        ]));
+        let mask = BooleanArray::from(vec![true, false, true, false, true]);
+
+        let result = scatter(&mask, truthy.as_ref())?;
+        let result = result
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+
+        assert_eq!(result.len(), 5);
+        assert!(result.is_valid(0));
+        assert_eq!(result.value(0), &[1, 2]);
+        assert!(result.is_null(1));
+        assert!(result.is_valid(2));
+        assert_eq!(result.value(2), &[3, 4]);
+        assert!(result.is_null(3));
+        assert!(result.is_valid(4));
+        assert_eq!(result.value(4), &[5, 6]);
         Ok(())
     }
 
