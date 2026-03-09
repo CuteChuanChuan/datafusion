@@ -294,16 +294,13 @@ where
             let len = view_u128 as u32;
             let is_inline = len <= 12;
 
-            // Fetch the input value bytes once to avoid redundant memory
-            // access during hash resolution and insertion.
-            // For inline strings (<=12 bytes), extract bytes directly
-            // from the view (no memory fetch needed).
             // For non-inline strings (>12 bytes), fetch once from the array.
-            let view_bytes = view_u128.to_le_bytes();
-            let input_value: &[u8] = if is_inline {
-                &view_bytes[4..4 + len as usize]
-            } else {
+            // to avoid redundant memory access during hash resolution and insertion.
+            // Inline strings (<= 12 bytes) use u128 directly.
+            let input_value: &[u8] = if !is_inline {
                 values.value(i).as_ref()
+            } else {
+                &[]
             };
 
             // Check if value already exists
@@ -351,13 +348,16 @@ where
                 payload
             } else {
                 // no existing value, make a new one
-                let payload = make_payload_fn(Some(input_value));
-                let new_view = if is_inline {
+                let (payload, new_view) = if is_inline {
+                    // Extract inline bytes from view (only for new values)
+                    let view_bytes = view_u128.to_le_bytes();
+                    let payload = make_payload_fn(Some(&view_bytes[4..4 + len as usize]));
                     self.views.push(view_u128);
                     self.nulls.append_non_null();
-                    view_u128
+                    (payload, view_u128)
                 } else {
-                    self.append_value(input_value)
+                    let payload = make_payload_fn(Some(input_value));
+                    (payload, self.append_value(input_value))
                 };
                 let new_header = Entry {
                     view: new_view,
