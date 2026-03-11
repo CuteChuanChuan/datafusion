@@ -42,7 +42,7 @@ impl ArrowBytesViewSet {
 
     /// Inserts each value from `values` into the set
     pub fn insert(&mut self, values: &ArrayRef) {
-        fn make_payload_fn(_value: Option<&[u8]>) {}
+        fn make_payload_fn() {}
         fn observe_payload_fn(_payload: ()) {}
         self.0
             .insert_if_new(values, make_payload_fn, observe_payload_fn);
@@ -209,7 +209,7 @@ where
         make_payload_fn: MP,
         observe_payload_fn: OP,
     ) where
-        MP: FnMut(Option<&[u8]>) -> V,
+        MP: FnMut() -> V,
         OP: FnMut(V),
     {
         // Sanity check array type
@@ -248,7 +248,7 @@ where
         mut make_payload_fn: MP,
         mut observe_payload_fn: OP,
     ) where
-        MP: FnMut(Option<&[u8]>) -> V,
+        MP: FnMut() -> V,
         OP: FnMut(V),
         B: ByteViewType,
     {
@@ -279,7 +279,7 @@ where
                 let payload = if let Some(&(payload, _offset)) = self.null.as_ref() {
                     payload
                 } else {
-                    let payload = make_payload_fn(None);
+                    let payload = make_payload_fn();
                     let null_index = self.views.len();
                     self.views.push(0);
                     self.nulls.append_null();
@@ -293,15 +293,6 @@ where
             // Extract length from the view (first 4 bytes of u128 in little-endian)
             let len = view_u128 as u32;
             let is_inline = len <= 12;
-
-            // For non-inline strings (>12 bytes), fetch once from the array.
-            // to avoid redundant memory access during hash resolution and insertion.
-            // Inline strings (<= 12 bytes) use u128 directly.
-            let input_value: &[u8] = if !is_inline {
-                values.value(i).as_ref()
-            } else {
-                &[]
-            };
 
             // Check if value already exists
             let maybe_payload = {
@@ -339,6 +330,7 @@ where
                         } else {
                             &in_progress[offset..offset + stored_len]
                         };
+                        let input_value: &[u8] = values.value(i).as_ref();
                         stored_value == input_value
                     })
                     .map(|entry| entry.payload)
@@ -348,16 +340,14 @@ where
                 payload
             } else {
                 // no existing value, make a new one
-                let (payload, new_view) = if is_inline {
-                    // Extract inline bytes from view (only for new values)
-                    let view_bytes = view_u128.to_le_bytes();
-                    let payload = make_payload_fn(Some(&view_bytes[4..4 + len as usize]));
+                let payload = make_payload_fn();
+                let new_view = if is_inline {
                     self.views.push(view_u128);
                     self.nulls.append_non_null();
-                    (payload, view_u128)
+                    view_u128
                 } else {
-                    let payload = make_payload_fn(Some(input_value));
-                    (payload, self.append_value(input_value))
+                    let value: &[u8] = values.value(i).as_ref();
+                    self.append_value(value)
                 };
                 let new_header = Entry {
                     view: new_view,
@@ -740,16 +730,12 @@ mod tests {
             }
 
             // insert the values into the map, recording what we did
-            let mut seen_new_strings = vec![];
             let mut seen_indexes = vec![];
             self.map.insert_if_new(
                 &arr,
-                |s| {
-                    let value = s
-                        .map(|s| String::from_utf8(s.to_vec()).expect("Non utf8 string"));
+                || {
                     let index = next_index;
                     next_index += 1;
-                    seen_new_strings.push(value);
                     TestPayload { index }
                 },
                 |payload| {
@@ -758,7 +744,7 @@ mod tests {
             );
 
             assert_eq!(actual_seen_indexes, seen_indexes);
-            assert_eq!(actual_new_strings, seen_new_strings);
+            assert_eq!(next_index, self.indexes.len());
         }
 
         /// Call `self.map.into_array()` validating that the strings are in the same
